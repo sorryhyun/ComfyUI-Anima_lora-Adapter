@@ -1,0 +1,4 @@
+node.zip
+*.pyc
+__pycache__/
+.ruff_cache/
