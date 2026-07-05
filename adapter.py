@@ -65,15 +65,35 @@ _VENDOR = _HERE / "_vendor"
 
 
 def _resolve_router_compute():
+    # First try whatever ``library`` currently resolves to: a live checkout of
+    # anima_lora when we run inside its env (so in-repo edits are picked up), or
+    # an already-cached vendor tree from a sibling anima node that happens to be
+    # a complete superset.
+    try:
+        return importlib.import_module("library.inference.router_compute")
+    except ImportError:
+        pass
+    # Force THIS node's ``_vendor`` tree. Under ComfyUI the live tree is not
+    # importable, and another anima custom node (loaded earlier — nodes load
+    # alphabetically, so ``comfyui-anima-directedit`` beats us) may have already
+    # cached an INCOMPLETE ``library`` namespace in ``sys.modules`` that lacks
+    # ``library.inference`` (its vendor only ships the editing subset). That
+    # partial tree shadows ours via ``sys.modules``, so merely prepending
+    # ``_VENDOR`` to ``sys.path`` is a no-op. Evict the anima namespaces and
+    # re-import from our own self-consistent ``_vendor`` superset. Sibling nodes
+    # already hold direct references to the callables they imported at load
+    # time, so repointing ``sys.modules['library']`` afterwards is safe.
     if _VENDOR.exists():
         if str(_VENDOR) not in sys.path:
             sys.path.insert(0, str(_VENDOR))
-        try:
-            return importlib.import_module("library.inference.router_compute")
-        except ImportError:
-            pass
-    # Fallback: a live ``library`` package already importable on sys.path
-    # (e.g. running inside a checkout of anima_lora).
+        for _name in [
+            k
+            for k in list(sys.modules)
+            if k in ("library", "networks") or k.startswith(("library.", "networks."))
+        ]:
+            del sys.modules[_name]
+        return importlib.import_module("library.inference.router_compute")
+    # No bundled vendor tree — surface the original import error.
     return importlib.import_module("library.inference.router_compute")
 
 
