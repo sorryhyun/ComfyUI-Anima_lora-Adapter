@@ -15,7 +15,7 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/sorryhyun/ComfyUI-Anima_lora-Adapter
 ```
 
-The nodes appear as **Anima Adapter Loader**, **Anima FeRA Loader**, and **Anima Soft Tokens Loader** in the loaders menu. No extra dependencies — the router kernels ship bundled under `_vendor/`.
+The nodes appear as **Anima Adapter Loader**, **Anima FeRA Loader**, **Anima Soft Tokens Loader**, **Anima Turbo Per-Step Expert Loader**, and **Anima Vocab Pack Loader (CJK)** in the loaders menu. No extra dependencies — the router kernels and the vocab-pack runtime ship bundled under `_vendor/`.
 
 ## The loaders
 
@@ -38,6 +38,15 @@ Sniffs the safetensors header and routes each component independently — you ge
 
 SoftREPA-parameterization soft tokens (Lee et al., arXiv:2503.08250): a bank of per-layer, per-timestep-bucket learned vectors is spliced into the crossattn embedding *inside* the first `n_layers` DiT blocks. Each block gets its own splice via a `forward_pre_hook` that rewrites the block's `crossattn_emb` argument — soft tokens use a *different* per-layer vector at each block; a `diffusion_model` pre-hook records the per-step sigma and precomputes the bank. Applies to the whole batch (both CFG branches) — soft tokens are part of the conditioning the trainer always saw. `n_layers` / `K` / `n_t_buckets` / splice position are read from the checkpoint (tensor shapes + `ss_splice_position`). Chain after the adapter loader when a workflow needs more than one.
 
+### Anima Vocab Pack Loader (CJK) — experimental
+
+| Input | Purpose |
+|-------|---------|
+| `model` + `clip` | both are patched — wire **both** outputs onward |
+| `vocab_pack` | pack from `models/vocab_packs/` — a `.safetensors` + `.json` pair with the same stem (copy **both** files) |
+
+Lets you type Japanese directly in the prompt (danbooru tags like `猫耳, 銀髪`, quoted phrases, mixed prompts) instead of translating to English first. A vocab pack is **not a LoRA**: it is a table of trained extra text-embedding rows (ids ≥ 32128) plus a JSON sidecar with the segmentation/row maps. The returned CLIP re-tokenizes CJK spans onto those rows via the pack's hybrid encoder (Qwen-tokenized CJK, ordinary T5 for everything else — prompt weighting `(タグ:1.2)` works); the returned MODEL serves the rows through a hook on `llm_adapter.embed`. **English-only prompts are bit-identical with or without this node.** Composes with any Anima checkpoint / LoRA / the other loaders (disjoint parameters). Test pack: [anima-vocab-pack-ja](https://huggingface.co/sorryhyun/anima-vocab-pack-ja) (Japanese; type character names in latin — full-JA rare-kanji names are a known v1 limitation; ko/zh not trained yet).
+
 ## How each component applies
 
 **Plain LoRA** → `ModelPatcher.add_patches`, the standard ComfyUI weight-patch path.
@@ -56,6 +65,8 @@ When chimera was trained with `content_router_source = "crossattn"` (`ss_chimera
 
 **Soft tokens** → per-block `forward_pre_hook` installed via `ModelPatcher.add_object_patch` on each of the first `n_layers` `diffusion_model.blocks.<idx>._forward_pre_hooks`, plus one `diffusion_model._forward_pre_hooks` pre-hook. The block pre-hook rewrites the block's `crossattn_emb` positional arg (overwriting the K padding-tail slots for `end_of_sequence`, or scattering after the real text tokens for `front_of_padding`); `forward` itself is untouched, same invariant as Hydra/ReFT. The model-level pre-hook recovers the `[0, 1]` sigma from comfy's `sigma × 1000` FLOW timesteps (`ModelSamplingDiscreteFlow` multiplier), bucketizes it, and precomputes the `(n_layers, B, K, D)` token bank the block hooks index. All hook installs go through `get_model_object`, so soft tokens compose with a prior adapter pre-hook on the same `_forward_pre_hooks` dict rather than clobbering it.
 
+**Vocab pack** → two surfaces. CLIP: the `AnimaTokenizer` on a cloned CLIP is wrapped so a CJK-containing prompt gets its `t5xxl` id stream re-encoded by the pack's `HybridT5Encoder` (the `qwen3_06b` stream and all non-CJK prompts pass through untouched). MODEL: ComfyUI core hardcodes the 32128-row `llm_adapter.embed`, and an id ≥ 32128 would crash the lookup — so a `forward_pre_hook` on `diffusion_model.llm_adapter._forward_pre_hooks` clamps ext ids to `<unk>` and stashes the originals, and a `forward_hook` on `llm_adapter.embed._forward_hooks` overwrites those positions with the pack's rows (gathered from a CPU-resident fp32 table per encode — no resident VRAM). Same hook-not-override invariant as everything else; both installs go through `add_object_patch` so they revert on `unpatch_model`.
+
 ## Why forward hooks, not `forward` override
 
 For both HydraLoRA and ReFT we install a `forward_hook` rather than overriding `block.forward` / `linear.forward`. Overriding `forward` strands weights on CPU under ComfyUI's cast-weights path: ComfyUI relies on walking the real `forward` to drive its `comfy_cast_weights` machinery, and replacing the method confused it — blocks ended up with `comfy_cast_weights=False` and their Linears stayed on CPU, producing a device mismatch at runtime. A hook leaves `forward` untouched, traces cleanly through `torch.compile`, and is properly reverted on `unpatch_model`.
@@ -67,13 +78,18 @@ For both HydraLoRA and ReFT we install a `forward_hook` rather than overriding `
 | `adapter.py` | LoRA / Hydra / ReFT loading, parsing, hook install |
 | `fera.py` | Author-faithful + plan2 stacked-experts FeRA loading |
 | `soft_tokens.py` | SoftREPA soft-token bank loading + per-block splice pre-hooks |
-| `nodes.py` | `AnimaAdapterLoader` / `AnimaFeraLoader` / `AnimaSoftTokensLoader` |
+| `vocab_pack.py` | CJK vocab-pack loading, tokenizer wrap + `llm_adapter.embed` hooks |
+| `nodes.py` | `AnimaAdapterLoader` / `AnimaFeraLoader` / `AnimaSoftTokensLoader` / `AnimaTurboPerStepExpertLoader` / `AnimaVocabPackLoader` |
 | `__init__.py` | Re-exports `NODE_CLASS_MAPPINGS` / `NODE_DISPLAY_NAME_MAPPINGS` |
 | `_vendor/` | Generated by `scripts/sync_vendor.py` — bundled copy of the router-compute kernels so the node works when not sitting inside the anima_lora repo |
 
 The pure-compute router math (FEI 2-band / FEI n-band high-to-low, σ sinusoidal features, σ-band partition mask) lives in `library/inference/router_compute.py` in the main repo. `adapter.py` resolves it live when the node is inside anima_lora, falls back to `_vendor/library/inference/router_compute.py` when standalone. Trained router weights are bit-sensitive to these kernels, so the vendored copy must stay in lockstep with the live tree — re-run `make vendor-sync` (or `python scripts/sync_vendor.py`) before publishing a new node version.
 
 ## Changelog
+
+### 3.9.0 — 2026-09-01 — Anima Vocab Pack Loader (CJK, experimental)
+
+New `AnimaVocabPackLoader` node `(MODEL, CLIP, vocab_pack) → (MODEL, CLIP)`: type Japanese directly in Anima prompts via a trained extended-vocab pack (extra `llm_adapter.embed` rows for ids ≥ 32128 + a hybrid CJK tokenizer on the t5xxl stream). Packs live in `models/vocab_packs/` as a `.safetensors` + `.json` pair; first test pack at [sorryhyun/anima-vocab-pack-ja](https://huggingface.co/sorryhyun/anima-vocab-pack-ja). English-only prompts are bit-identical with or without the node. The `_vendor/` tree now also carries `library/anima/ext_vocab.py` (the segmentation + hybrid-encoder runtime, promoted out of the anima_lora bench into `library/anima/`).
 
 ### 3.8.0 — 2026-05-27 — ChimeraHydra hardwired-FEI freq routing
 

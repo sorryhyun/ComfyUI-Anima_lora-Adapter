@@ -25,12 +25,27 @@ training method was archived (the prefix / postfix / cond splice has no
 live trainer; see the repo's _archive/postfix/).
 """
 
+import os
+
 import folder_paths
 
 from .adapter import apply_adapter
 from .fera import apply_fera
 from .soft_tokens import apply_soft_tokens
 from .step_expert import apply_step_expert, parse_step_expert
+from .vocab_pack import (
+    VocabPackTokenizer,
+    apply_vocab_pack,
+    build_encoder,
+    load_vocab_pack,
+)
+
+# Vocab packs are not LoRAs — give them their own models/ folder so they
+# don't pollute the LoRA pickers (and vice versa).
+folder_paths.add_model_folder_path(
+    "vocab_packs", os.path.join(folder_paths.models_dir, "vocab_packs")
+)
+os.makedirs(os.path.join(folder_paths.models_dir, "vocab_packs"), exist_ok=True)
 
 
 class AnimaAdapterLoader:
@@ -328,11 +343,65 @@ class AnimaTurboPerStepExpertLoader:
         return (new_model,)
 
 
+class AnimaVocabPackLoader:
+    """Apply a CJK vocab pack to a MODEL + CLIP pair.
+
+    A vocab pack extends Anima's T5-side vocabulary with trained rows so
+    Japanese prompts (danbooru tags, quoted phrases) work typed directly,
+    instead of degrading to ``<unk>`` on the t5xxl stream. Wraps the CLIP's
+    tokenizer (CJK spans -> ext ids; pure-English prompts bit-identical)
+    and hooks the DiT's ``llm_adapter.embed`` to serve the extra rows.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        packs = folder_paths.get_filename_list("vocab_packs")
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vocab_pack": (
+                    packs,
+                    {
+                        "tooltip": (
+                            "Vocab pack from models/vocab_packs/ — a "
+                            ".safetensors + .json pair with the same stem "
+                            "(copy BOTH files). Not a LoRA."
+                        )
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP")
+    FUNCTION = "apply"
+    CATEGORY = "loaders"
+    DESCRIPTION = (
+        "Anima CJK vocab pack loader. Lets you type Japanese directly in the "
+        "prompt: CJK spans tokenize to the pack's extended embedding rows "
+        "(ids >= 32128), served to llm_adapter.embed by a forward hook. "
+        "English-only prompts are bit-identical with or without this node. "
+        "Wire both outputs — the returned CLIP does the CJK tokenization, "
+        "the returned MODEL serves the rows."
+    )
+
+    def apply(self, model, clip, vocab_pack):
+        file_path = folder_paths.get_full_path("vocab_packs", vocab_pack)
+        table, mapping = load_vocab_pack(file_path)
+        encoder = build_encoder(clip, mapping)
+        new_model = model.clone()
+        apply_vocab_pack(new_model, table)
+        new_clip = clip.clone()
+        new_clip.tokenizer = VocabPackTokenizer(new_clip.tokenizer, encoder)
+        return (new_model, new_clip)
+
+
 NODE_CLASS_MAPPINGS = {
     "AnimaAdapterLoader": AnimaAdapterLoader,
     "AnimaFeraLoader": AnimaFeraLoader,
     "AnimaSoftTokensLoader": AnimaSoftTokensLoader,
     "AnimaTurboPerStepExpertLoader": AnimaTurboPerStepExpertLoader,
+    "AnimaVocabPackLoader": AnimaVocabPackLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -340,4 +409,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AnimaFeraLoader": "Anima FeRA Loader",
     "AnimaSoftTokensLoader": "Anima Soft Tokens Loader",
     "AnimaTurboPerStepExpertLoader": "Anima Turbo Per-Step Expert Loader",
+    "AnimaVocabPackLoader": "Anima Vocab Pack Loader (CJK)",
 }

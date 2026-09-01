@@ -15,10 +15,14 @@ a workflow needs more than one:
     (Lee et al., arXiv:2503.08250): per-layer × per-timestep-bucket
     learned tokens spliced into the crossattn embedding inside the first
     n_layers DiT blocks via per-block forward pre-hooks.
+  - ``AnimaVocabPackLoader`` — CJK vocab pack: extended T5-side
+    embedding rows + hybrid CJK tokenization so Japanese prompts work
+    typed directly. Takes and returns (MODEL, CLIP) — wire both.
 
 ``AnimaFeraLoader`` was added in v3.1.0; ``AnimaSoftTokensLoader`` in
-v3.6.0. The ``AnimaPostfixLoader`` node was retired when the postfix
-training method was archived (no live trainer).
+v3.6.0; ``AnimaVocabPackLoader`` in v3.9.0. The ``AnimaPostfixLoader``
+node was retired when the postfix training method was archived (no live
+trainer).
 """
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS

@@ -4,12 +4,13 @@
 
 ComfyUI custom nodes that dispatch Anima-trained interventions (LoRA / HydraLoRA / ReFT / soft tokens) through ComfyUI's patching system. Exists because vanilla ComfyUI's weight-patcher silently drops non-LoRA keys (`reft_*`, `lora_ups`, soft-token banks), so a Hydra/ReFT/soft-token checkpoint loaded with a stock LoRA loader produces wrong output with no warning.
 
-Four single-purpose nodes (adapter + postfix split in v3.0.0, FeRA added in v3.1.0, soft tokens in v3.6.0, postfix loader retired in v3.7.0, per-step-expert turbo added later):
+Five single-purpose nodes (adapter + postfix split in v3.0.0, FeRA added in v3.1.0, soft tokens in v3.6.0, postfix loader retired in v3.7.0, per-step-expert turbo added later, vocab pack in v3.9.0):
 
   - `AnimaAdapterLoader` — LoRA / HydraLoRA / ReFT (`adapter.py`).
   - `AnimaFeraLoader` — author-faithful FeRA (`fera.py`).
   - `AnimaSoftTokensLoader` — SoftREPA-parameterization soft tokens (`soft_tokens.py`).
   - `AnimaTurboPerStepExpertLoader` — per-step-expert turbo students (`step_expert.py`). Head k → denoise step k by a step counter; needs cfg=1.0 and infer_steps = trained K. Mutually exclusive with the other loaders on the same checkpoint.
+  - `AnimaVocabPackLoader` — CJK vocab pack (`vocab_pack.py`): `(MODEL, CLIP, pack) → (MODEL, CLIP)`, both outputs must be wired. Packs are `.safetensors` + same-stem `.json` pairs in `models/vocab_packs/` (folder registered at import). Not a LoRA — extra `llm_adapter.embed` rows (ids ≥ 32128) + tokenizer wrap.
 
 Chain them `MODEL → <adapter or fera> → AnimaSoftTokensLoader → MODEL` when a workflow needs more than one; later nodes see the model with earlier modifications already in place. `AnimaAdapterLoader` and `AnimaFeraLoader` are mutually exclusive — author-faithful FeRA and HydraLoRA-moe are alternative router schemes (see `library/inference/models.py`). The `AnimaPostfixLoader` (prefix / postfix / cond splice) was retired in v3.7.0 when the postfix training method was archived (`_archive/postfix/`); soft tokens cover the per-block crossattn-splice case now.
 
@@ -24,9 +25,10 @@ Full user-facing docs and changelog live in `README.md`. This file is for code-l
 | `fera.py` | Author-faithful FeRA + plan2 `stacked_experts_global_fei` parsing + apply. Imports the FEI kernels from `adapter.py` — the ordering split (high→low for author-faithful, low→high for plan2) lives on the kernel names, not duplicated implementations. |
 | `soft_tokens.py` | SoftREPA soft-token bank loading (`load_soft_tokens`) + per-block splice via `forward_pre_hook`. Standalone — no ComfyUI imports at module scope (only `apply_soft_tokens` touches the ModelPatcher), and no router-compute dependency, so it isn't part of the `_vendor` surface. |
 | `step_expert.py` | Per-step-expert turbo (`ss_turbo_per_step_expert=1`): shared `lora_down` + K up-heads, head k → denoise step k by a forward-count-modulo-K counter (no router). `parse_step_expert` discriminates on the metadata stamp (the `.lora_ups.{k}.weight` shape alone is ambiguous with Hydra) and splits fused qkv/kv → q/k/v (`_ATTN_FUSE_SPECS` inlined, so no cross-package dep). `apply_step_expert` installs a `diffusion_model._forward_pre_hooks` step-counter pre-hook + per-Linear `forward_hook`s. No router-compute dependency → exempt from `_vendor`. Reuses `_resolve_module` from `adapter.py`. |
-| `nodes.py` | `AnimaAdapterLoader` + `AnimaFeraLoader` + `AnimaSoftTokensLoader` ComfyUI node definitions. |
+| `vocab_pack.py` | CJK vocab-pack load (`ext_embed` + same-stem JSON sidecar, cached), `VocabPackTokenizer` (wraps `AnimaTokenizer`; rewrites the `t5xxl` stream via `HybridT5Encoder` only when the prompt contains CJK — pure-EN prompts bit-identical), and `apply_vocab_pack` (llm_adapter pre-hook clamps ids ≥ 32128 to `<unk>` + `embed` forward_hook overwrites those rows from a CPU-resident table). Owns its own live-or-vendor resolver for `library.anima.ext_vocab` (same eviction story as adapter.py's). The Qwen side needs a **fast** tokenizer (offset mappings) — built from comfy's bundled `qwen25_tokenizer` dir, vocab-identical to Qwen3-0.6B's. |
+| `nodes.py` | `AnimaAdapterLoader` + `AnimaFeraLoader` + `AnimaSoftTokensLoader` + `AnimaTurboPerStepExpertLoader` + `AnimaVocabPackLoader` ComfyUI node definitions; registers the `vocab_packs` models folder. |
 | `__init__.py` | Re-exports `NODE_CLASS_MAPPINGS` / `NODE_DISPLAY_NAME_MAPPINGS`. |
-| `_vendor/` | Bundled copy of `library/inference/router_compute.py` + transitive deps (`library/runtime/fei.py`, `networks/lora_modules/router_state.py`). **Written into this repo** by `scripts/sync_vendor.py` in the anima_lora repo (`make vendor-sync` there) — the authoritative router kernels at inference. Do not hand-edit. |
+| `_vendor/` | Bundled copy of `library/inference/router_compute.py` + transitive deps (`library/runtime/fei.py`, `networks/lora_modules/router_state.py`) + `library/anima/ext_vocab.py` (vocab-pack runtime — the trained ext rows are keyed to its exact segmentation). **Written into this repo** by `scripts/sync_vendor.py` in the anima_lora repo (`make vendor-sync` there) — the authoritative copies at inference. Do not hand-edit. |
 
 ## Router-compute single source of truth
 
@@ -45,6 +47,7 @@ Each node sniffs its safetensors header and routes each component independently 
 | FeRA (author-faithful) | One global `forward_pre_hook` on `diffusion_model._forward_pre_hooks` computes per-step FEI + router gates; per-Linear `forward_hook`s on each adapted Linear's `_forward_hooks` add the gated stacked-expert correction. Same hook-not-override invariant as Hydra. |
 | ReFT | Per-block `forward_hook` installed via `ModelPatcher.add_object_patch` on `diffusion_model.blocks.<idx>._forward_hooks`. |
 | Soft tokens | Per-block `forward_pre_hook` on the first `n_layers` `diffusion_model.blocks.<idx>._forward_pre_hooks` rewrites each block's `crossattn_emb` arg; one `diffusion_model._forward_pre_hooks` pre-hook records per-step σ and precomputes the bank. Whole batch (both CFG branches). Hook-not-override invariant holds (block `forward` is untouched). |
+| Vocab pack | CLIP: cloned CLIP's `tokenizer` replaced with `VocabPackTokenizer` (plain attribute on the clone — not patcher-managed; the original CLIP is untouched). MODEL: `forward_pre_hook` on `diffusion_model.llm_adapter._forward_pre_hooks` (clamp ids ≥ 32128, stash originals) + `forward_hook` on `diffusion_model.llm_adapter.embed._forward_hooks` (overwrite those positions with pack rows). Note comfy runs `preprocess_text_embeds` at **cond-encode time** under `torch.inference_mode` (`model_base.Anima.extra_conds`), not per denoise step — the hooks fire there because it calls the same `llm_adapter` module; the per-step `CONDRegular` path (training mode) also works. |
 
 ## Critical invariant: forward_hook, never override `forward`
 
