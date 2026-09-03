@@ -87,6 +87,10 @@ The pure-compute router math (FEI 2-band / FEI n-band high-to-low, σ sinusoidal
 
 ## Changelog
 
+### 3.9.1 — 2026-09-03 — vocab pack: symbol routing comes from the pack
+
+The rule deciding which prompt characters leave the T5 spiece path now lives in the pack's `.json` (`route`), not in node code. Packs built from 2026-09-03 route, besides CJK, the symbol tail T5 cannot spell — `^^^` `:<` `^ ^` `~` `·` `×` `☆` `\`, kaomoji, emoji — which the stock tokenizer used to fold into a single shared `<unk>`; those get their own rows (appended after the CJK rows, so older packs' row ids are unchanged). A pack without `route` behaves exactly as before (CJK only), and English-only prompts stay bit-identical. Vendored `ext_vocab.py` re-synced; an older node with a new pack simply keeps symbols on `<unk>`.
+
 ### 3.9.0 — 2026-09-01 — Anima Vocab Pack Loader (CJK, experimental)
 
 New `AnimaVocabPackLoader` node `(MODEL, CLIP, vocab_pack) → (MODEL, CLIP)`: type Japanese directly in Anima prompts via a trained extended-vocab pack (extra `llm_adapter.embed` rows for ids ≥ 32128 + a hybrid CJK tokenizer on the t5xxl stream). Packs live in `models/vocab_packs/` as a `.safetensors` + `.json` pair; first test pack at [sorryhyun/anima-vocab-pack-ja](https://huggingface.co/sorryhyun/anima-vocab-pack-ja). English-only prompts are bit-identical with or without the node. The `_vendor/` tree now also carries `library/anima/ext_vocab.py` (the segmentation + hybrid-encoder runtime, promoted out of the anima_lora bench into `library/anima/`).

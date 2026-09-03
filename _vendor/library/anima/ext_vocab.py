@@ -22,6 +22,16 @@ bit-identically (527 such pairs, e.g. 鯰/鰯 — the Phase 0.2 separability
 finding); exactly those colliding rows use a position-weighted mean instead,
 which breaks the tie while leaving every non-colliding row at the plain mean.
 
+Symbol routing (2026-09-03): the stock spiece also has no row for a long
+tail of non-CJK symbols (``^`` ``<`` ``~`` ``·`` ``×`` ``☆``, emoji …) that
+danbooru tags and zh names use — T5 folds ``^^^`` into a single ``<unk>``, so
+``^^^`` / ``☆`` / ``\\`` were the same token. Those chars are routed to the
+Qwen side exactly like CJK, with their rows appended *after* the CJK blocks
+(``mapping["sym"]`` / ``mapping["sym_char"]``) so every pre-existing row id,
+distill cache and trained pack stays valid. The routing rule ships **inside
+the pack json** (``mapping["route"]``); a pack without it routes the legacy
+CJK ranges only, bit-identical to before.
+
 Pure-CPU module — no model load; consumers pass embedding tensors in.
 """
 
@@ -63,17 +73,114 @@ def is_hangul_char(ch: str) -> bool:
     return 0xAC00 <= o <= 0xD7AF or 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F
 
 
-def segment_runs(text: str) -> list[tuple[str, str]]:
+@dataclass(frozen=True)
+class Route:
+    """Which characters leave the T5 spiece path for the Qwen-side ext rows.
+
+    ``ranges`` are inclusive codepoint intervals (the legacy CJK blocks);
+    ``chars`` is an explicit set (the symbol tail, chosen at build time as
+    "T5 emits ``<unk>`` for it"). Serialised into the pack json so the
+    ComfyUI node and the trainer segment a prompt identically without a code
+    release per rule change; a pack that carries no ``route`` gets
+    :meth:`default`, which is exactly :func:`is_cjk_char`.
+    """
+
+    ranges: tuple[tuple[int, int], ...] = _CJK_RANGES
+    chars: frozenset[str] = frozenset()
+
+    def __call__(self, ch: str) -> bool:
+        if ch in self.chars:
+            return True
+        o = ord(ch)
+        return any(lo <= o <= hi for lo, hi in self.ranges)
+
+    def any(self, text: str) -> bool:
+        return any(self(c) for c in text)
+
+    @classmethod
+    def default(cls) -> "Route":
+        return cls()
+
+    @classmethod
+    def from_mapping(cls, mapping: dict | None) -> "Route":
+        spec = (mapping or {}).get("route")
+        if not spec:
+            return cls.default()
+        ranges = tuple((int(lo), int(hi)) for lo, hi in spec.get("ranges", _CJK_RANGES))
+        return cls(ranges=ranges, chars=frozenset(spec.get("chars", "")))
+
+    def to_json(self) -> dict:
+        return {
+            "ranges": [list(r) for r in self.ranges],
+            "chars": "".join(sorted(self.chars)),
+        }
+
+
+# Candidate blocks scanned by ``symbol_route_chars`` — ASCII/Latin-1 symbols,
+# general punctuation through dingbats, enclosed/compat CJK, variation
+# selectors, emoji. Letters in these blocks that T5 *can* spell are filtered
+# out by the ``<unk>`` test, so only genuine spiece gaps get routed.
+SYMBOL_CANDIDATE_RANGES = (
+    (0x0021, 0x007E),  # ASCII printable (^ < > ~ \ ` { } | …)
+    (0x00A1, 0x00BF),  # Latin-1 punctuation & symbols (¡ · ¿ …)
+    (0x00D7, 0x00D7),  # ×
+    (0x00F7, 0x00F7),  # ÷
+    # Kaomoji alphabet — (˘ω˘) ٩(◕‿◕｡)۶ (꒳) ˗ˏˋ ˎˊ˗ — spelled with IPA /
+    # spacing modifiers, combining marks, Greek, Arabic and Yi radicals; the
+    # <unk> test keeps only what T5 cannot spell.
+    (0x0250, 0x036F),  # IPA extensions, spacing modifier letters, combining marks
+    (0x0370, 0x03FF),  # Greek (ω ρ δ …)
+    (0x0600, 0x06FF),  # Arabic (٩ ۶ و …)
+    (0x1D00, 0x1DBF),  # phonetic extensions (ᵕ ᴗ …)
+    (0x2000, 0x2BFF),  # general punct, arrows, math, shapes, misc symbols, dingbats
+    (0x2E00, 0x2E7F),  # supplemental punctuation
+    (0x3200, 0x33FF),  # enclosed CJK letters/months, CJK compatibility (㊙ ㎝ …)
+    (0xA490, 0xA4CF),  # Yi radicals (꒳)
+    (0xFE00, 0xFE0F),  # variation selectors (emoji presentation U+FE0F)
+    (0x1F000, 0x1FAFF),  # emoji & pictographs
+)
+
+
+def symbol_route_chars(t5_tok, qwen_tok, candidates=SYMBOL_CANDIDATE_RANGES) -> str:
+    """Chars T5 spiece cannot encode (emits ``<unk>``) but Qwen round-trips.
+
+    Deterministic given the two tokenizers, so the result is written into the
+    pack json once (``route.chars``) and never recomputed at load time. Chars
+    already inside the legacy CJK ranges are excluded (they route anyway).
+    """
+    base = Route.default()
+    out: list[str] = []
+    for lo, hi in candidates:
+        for o in range(lo, hi + 1):
+            ch = chr(o)
+            if base(ch) or ch.isspace():
+                continue
+            t5_ids = t5_tok(ch, add_special_tokens=False)["input_ids"]
+            if T5_UNK_ID not in t5_ids:
+                continue
+            q_ids = qwen_tok(ch, add_special_tokens=False)["input_ids"]
+            if not q_ids or qwen_tok.decode(q_ids) != ch:
+                continue
+            out.append(ch)
+    return "".join(out)
+
+
+def segment_runs(text: str, route: "Route | None" = None) -> list[tuple[str, str]]:
     """Split text into ("t5"|"cjk", span) runs.
 
-    Whitespace immediately preceding a CJK run is folded into it (Qwen's
+    ``route`` decides which chars leave the spiece path (default: the legacy
+    CJK ranges). The "cjk" kind name is kept for every routed run — symbol
+    runs included — because the row lookup downstream is the same.
+
+    Whitespace immediately preceding a routed run is folded into it (Qwen's
     byte-BPE handles leading spaces natively; T5 spiece would just emit a
     bare ``▁``).
     """
+    route = route or is_cjk_char
     runs: list[tuple[str, str]] = []
     buf, kind = [], None
     for ch in text:
-        k = "cjk" if is_cjk_char(ch) else "t5"
+        k = "cjk" if route(ch) else "t5"
         if k != kind and buf:
             runs.append((kind, "".join(buf)))
             buf = []
@@ -97,14 +204,25 @@ def segment_runs(text: str) -> list[tuple[str, str]]:
     return merged
 
 
-def collect_clean_qwen_tokens(qwen_tok) -> dict[int, str]:
-    """Qwen token ids whose decoded surface is pure CJK (spaces allowed)."""
+def collect_clean_qwen_tokens(qwen_tok, chars: str | None = None) -> dict[int, str]:
+    """Qwen token ids whose decoded surface is pure CJK (spaces allowed).
+
+    With ``chars`` given, the surface must instead be made only of those
+    chars (plus spaces) — the symbol block. The two calls partition the
+    vocab: a token mixing CJK and symbol chars lands in neither and resolves
+    per-char through the fragment path at encode time.
+    """
     n = qwen_tok.vocab_size
     surfaces = qwen_tok.batch_decode([[i] for i in range(n)])
+    if chars is None:
+        ok = is_cjk_char
+    else:
+        allowed = frozenset(chars)
+        ok = allowed.__contains__
     clean = {}
     for i, s in enumerate(surfaces):
         core = s.strip()
-        if core and "�" not in s and all(is_cjk_char(c) or c == " " for c in s):
+        if core and "�" not in s and all(ok(c) or c == " " for c in s):
             clean[i] = s
     return clean
 
@@ -129,6 +247,9 @@ def build_anchor_pairs(t5_tok, qwen_tok) -> tuple[list[int], list[int]]:
     return t5_ids, qwen_ids
 
 
+MAP_METHODS = ("ridge", "procrustes-mix")
+
+
 def fit_anchor_map(
     qwen_embed: torch.Tensor,
     t5_embed: torch.Tensor,
@@ -136,11 +257,27 @@ def fit_anchor_map(
     qwen_ids: list[int],
     ridge: float = 1e-2,
     holdout: int = 1000,
+    method: str = "ridge",
+    mix: float = 0.6,
 ) -> tuple[torch.Tensor, float]:
-    """Ridge least-squares W (d_qwen × d_t5) with a held-out cosine sanity.
+    """Anchor map W (d_qwen × d_t5) with a held-out cosine sanity.
+
+    ``method="ridge"`` — plain ridge least squares (the v1 asset). Ridge
+    shrinks toward the directions the anchors share, so the mapped ext keys
+    collapse onto a thin subspace (PR 236 of 1024, 16 % of random row pairs
+    above cos 0.5; ``probes/map_probe.py``, 2026-09-02).
+
+    ``method="procrustes-mix"`` — ridge plus ``mix`` × the scaled orthogonal
+    Procrustes rotation fitted on the same anchors (centered fit, applied as
+    a plain linear map like the ridge term). The rotation carries the
+    Qwen spectrum through untouched, so the mix keeps the ext keys spread
+    (PR 373, 1 % collisions) for a small held-out cost (cos 0.75 → 0.70).
+    ``mix=0.6`` is the probe's measured point; the v2 asset default.
 
     Returns (W, mean held-out cosine of ``qwen_embed @ W`` vs the true T5 row).
     """
+    if method not in MAP_METHODS:
+        raise ValueError(f"unknown anchor-map method {method!r} (want {MAP_METHODS})")
     A = qwen_embed[qwen_ids].float()
     B = t5_embed[t5_ids].float()
     g = torch.Generator().manual_seed(0)
@@ -150,8 +287,42 @@ def fit_anchor_map(
     d = At.shape[1]
     lam = ridge * At.pow(2).mean() * len(train)
     W = torch.linalg.solve(At.T @ At + lam * torch.eye(d), At.T @ Bt)
+    if method == "procrustes-mix":
+        ma, mb = At.mean(0), Bt.mean(0)
+        U, _, Vt = torch.linalg.svd((At - ma).T @ (Bt - mb))
+        R = U @ Vt
+        scale = float((Bt - mb).norm() / ((At - ma) @ R).norm())
+        W = W + mix * (R * scale)
     cos = torch.nn.functional.cosine_similarity(A[hold] @ W, B[hold], dim=-1)
     return W, float(cos.mean())
+
+
+def char_row_surfaces(
+    qwen_tok, clean: dict[int, str], chars: str | None = None
+) -> dict[str, list[int]]:
+    """Chars that get a supplementary row → their Qwen byte-fragment ids.
+
+    Every standard-range char that is not itself a clean single Qwen token
+    and round-trips through the tokenizer. Shared by the table builder and
+    the contextual-init path (``build_ext.py --char-init contextual``), so
+    both see the identical char inventory and row order. ``chars`` swaps the
+    legacy CJK ranges for an explicit inventory (the symbol block).
+    """
+    single_clean = {s: qid for qid, s in clean.items() if len(s) == 1}
+    char_ids: dict[str, list[int]] = {}
+    inventory = (
+        (chr(o) for lo, hi in _CJK_RANGES for o in range(lo, hi + 1))
+        if chars is None
+        else iter(chars)
+    )
+    for ch in inventory:
+        if ch in single_clean:
+            continue
+        ids = qwen_tok(ch, add_special_tokens=False)["input_ids"]
+        if not ids or qwen_tok.decode(ids) != ch:
+            continue
+        char_ids[ch] = ids
+    return char_ids
 
 
 def build_ext_table(
@@ -159,6 +330,10 @@ def build_ext_table(
     qwen_embed: torch.Tensor,
     W: torch.Tensor,
     clean: dict[int, str],
+    char_init: dict[str, torch.Tensor] | None = None,
+    *,
+    symbols: str | None = None,
+    sym_clean: dict[int, str] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Extended rows + id mapping.
 
@@ -167,6 +342,20 @@ def build_ext_table(
     (init = mapped mean of fragment embeddings; chars sharing a fragment-id
     multiset with another char get a position-weighted mean so permuted byte
     orders cannot land on bit-identical rows).
+
+    ``char_init`` — optional per-char vectors *already in T5 space* that
+    replace the fragment-mean init for the chars they cover (the v2 asset's
+    contextual init: the fragment mean is near-degenerate because the lead
+    byte is shared by thousands of chars — 60 % of random char-row pairs
+    above cos 0.5, ``probes/char_probe.py``). Chars not covered keep the
+    fragment mean. The id mapping is identical either way.
+
+    ``symbols`` (the string :func:`symbol_route_chars` returns) + ``sym_clean``
+    (``collect_clean_qwen_tokens(qwen_tok, chars=symbols)``) append the symbol
+    block **after** the two CJK blocks: symbol tokens sorted by Qwen id, then
+    per-char rows for symbol chars that are byte-fragments. Row ids of the
+    CJK blocks are untouched, so a table built with symbols is a strict
+    superset of one built without.
     """
     qwen_map: dict[int, int] = {}
     vecs: list[torch.Tensor] = []
@@ -174,42 +363,60 @@ def build_ext_table(
         qwen_map[qid] = len(vecs)
         vecs.append(qwen_embed[qid].float() @ W)
 
-    single_clean = {s: qid for qid, s in clean.items() if len(s) == 1}
-    char_ids: dict[str, list[int]] = {}
-    for lo, hi in _CJK_RANGES:
-        for o in range(lo, hi + 1):
-            ch = chr(o)
-            if ch in single_clean:
+    def _char_rows(char_ids: dict[str, list[int]]) -> tuple[dict[str, int], int]:
+        by_multiset: dict[tuple[int, ...], int] = {}
+        for ids in char_ids.values():
+            key = tuple(sorted(ids))
+            by_multiset[key] = by_multiset.get(key, 0) + 1
+        cmap: dict[str, int] = {}
+        n_ctx = 0
+        for ch, ids in char_ids.items():
+            if char_init is not None and ch in char_init:
+                cmap[ch] = len(vecs)
+                vecs.append(char_init[ch].float().reshape(-1))
+                n_ctx += 1
                 continue
-            ids = qwen_tok(ch, add_special_tokens=False)["input_ids"]
-            if not ids or qwen_tok.decode(ids) != ch:
-                continue
-            char_ids[ch] = ids
+            emb = qwen_embed[ids].float()
+            if by_multiset[tuple(sorted(ids))] > 1:
+                # Same byte multiset as another char — order is the only
+                # distinguishing signal, so pool with position weights 1..n.
+                w = torch.arange(1, len(ids) + 1, dtype=torch.float32)
+                pooled = (emb * w.unsqueeze(1)).sum(dim=0) / w.sum()
+            else:
+                pooled = emb.mean(dim=0)
+            cmap[ch] = len(vecs)
+            vecs.append(pooled @ W)
+        return cmap, n_ctx
 
-    by_multiset: dict[tuple[int, ...], int] = {}
-    for ids in char_ids.values():
-        key = tuple(sorted(ids))
-        by_multiset[key] = by_multiset.get(key, 0) + 1
+    char_map, n_contextual = _char_rows(char_row_surfaces(qwen_tok, clean))
+    n_cjk = len(vecs)
 
-    char_map: dict[str, int] = {}
-    for ch, ids in char_ids.items():
-        emb = qwen_embed[ids].float()
-        if by_multiset[tuple(sorted(ids))] > 1:
-            # Same byte multiset as another char — order is the only
-            # distinguishing signal, so pool with position weights 1..n.
-            w = torch.arange(1, len(ids) + 1, dtype=torch.float32)
-            pooled = (emb * w.unsqueeze(1)).sum(dim=0) / w.sum()
-        else:
-            pooled = emb.mean(dim=0)
-        char_map[ch] = len(vecs)
-        vecs.append(pooled @ W)
+    sym_map: dict[int, int] = {}
+    sym_char_map: dict[str, int] = {}
+    route = Route.default()
+    if symbols:
+        sym_clean = sym_clean or {}
+        for qid in sorted(sym_clean):
+            sym_map[qid] = len(vecs)
+            vecs.append(qwen_embed[qid].float() @ W)
+        sym_char_map, n_sym_ctx = _char_rows(
+            char_row_surfaces(qwen_tok, sym_clean, chars=symbols)
+        )
+        n_contextual += n_sym_ctx
+        route = Route(chars=frozenset(symbols))
 
     table = torch.stack(vecs) if vecs else torch.zeros(0, W.shape[1])
     mapping = {
         "qwen": {str(k): v for k, v in qwen_map.items()},
         "char": char_map,
         "rows": table.shape[0],
+        "char_rows_contextual": n_contextual,
     }
+    if symbols:
+        mapping["sym"] = {str(k): v for k, v in sym_map.items()}
+        mapping["sym_char"] = sym_char_map
+        mapping["sym_rows"] = [n_cjk, table.shape[0]]
+        mapping["route"] = route.to_json()
     return table, mapping
 
 
@@ -228,6 +435,8 @@ class HybridT5Encoder:
     qwen_map: dict[int, int]
     char_map: dict[str, int]
     word_map: dict[str, int] | None = None
+    # Which chars leave the spiece path. ``None`` = the legacy CJK ranges.
+    route: Route | None = None
     # surface → base-vocab t5 id sequence (the C fallback: substitute a known
     # CJK surface with the EN tag's stock spiece tokens at encode time — the
     # pretrained rows carry the identity no minted row learns; zero training).
@@ -236,10 +445,15 @@ class HybridT5Encoder:
     @classmethod
     def from_mapping(cls, t5_tok, qwen_tok, mapping: dict) -> "HybridT5Encoder":
         qwen_map = {int(k): v for k, v in mapping["qwen"].items()}
+        # The symbol block (if the pack has one) is a plain extension of the
+        # same two lookups — kept separate in the json only so the CJK row
+        # ids stay contiguous for everything that indexes them.
+        qwen_map.update({int(k): v for k, v in (mapping.get("sym") or {}).items()})
         # Chars that are clean single tokens were excluded from char_map (no
         # separate row needed) — but they can still arrive as byte-fragments
         # mid-word, so the char lookup must cover them via their token row.
         char_map = dict(mapping["char"])
+        char_map.update(mapping.get("sym_char") or {})
         ids = sorted(qwen_map)
         for qid, s in zip(ids, qwen_tok.batch_decode([[i] for i in ids])):
             core = s.strip()
@@ -252,7 +466,12 @@ class HybridT5Encoder:
             char_map=char_map,
             word_map=mapping.get("word") or None,
             word_sub=mapping.get("word_sub") or None,
+            route=Route.from_mapping(mapping),
         )
+
+    def routes(self, text: str) -> bool:
+        """Does any char of ``text`` leave the spiece path under this pack?"""
+        return (self.route or Route.default()).any(text)
 
     def _encode_cjk(self, span: str) -> tuple[list[int], list[tuple[int, int]]]:
         """(ids, char offsets into ``span``) for one CJK run."""
@@ -370,7 +589,7 @@ class HybridT5Encoder:
         ids: list[int] = []
         offs: list[tuple[int, int]] = []
         base = 0
-        for kind, span in segment_runs(text):
+        for kind, span in segment_runs(text, self.route):
             if kind == "cjk":
                 s_ids, s_offs = self._encode_cjk_words(span)
             else:

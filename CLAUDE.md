@@ -4,7 +4,7 @@
 
 ComfyUI custom nodes that dispatch Anima-trained interventions (LoRA / HydraLoRA / ReFT / soft tokens) through ComfyUI's patching system. Exists because vanilla ComfyUI's weight-patcher silently drops non-LoRA keys (`reft_*`, `lora_ups`, soft-token banks), so a Hydra/ReFT/soft-token checkpoint loaded with a stock LoRA loader produces wrong output with no warning.
 
-Five single-purpose nodes (adapter + postfix split in v3.0.0, FeRA added in v3.1.0, soft tokens in v3.6.0, postfix loader retired in v3.7.0, per-step-expert turbo added later, vocab pack in v3.9.0):
+Five single-purpose nodes (adapter + postfix split in v3.0.0, FeRA added in v3.1.0, soft tokens in v3.6.0, postfix loader retired in v3.7.0, per-step-expert turbo added later, vocab pack in v3.9.0, pack-carried symbol routing in v3.9.1):
 
   - `AnimaAdapterLoader` — LoRA / HydraLoRA / ReFT (`adapter.py`).
   - `AnimaFeraLoader` — author-faithful FeRA (`fera.py`).

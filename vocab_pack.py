@@ -7,11 +7,15 @@ dedicated rows instead of degrading to ``<unk>`` on the T5 side. Two patch
 surfaces, both reverted by ComfyUI's normal unpatch machinery:
 
 - **CLIP side**: the ``AnimaTokenizer`` is wrapped so that a prompt
-  containing CJK characters gets its ``t5xxl`` id stream re-encoded by
-  ``HybridT5Encoder`` (CJK spans -> ext ids via the Qwen tokenizer; non-CJK
-  runs through the ordinary T5 tokenizer). Prompts with no CJK characters
-  return the inner tokenizer's stream untouched — pure-English prompts are
-  bit-identical with or without the pack.
+  containing a *routed* character gets its ``t5xxl`` id stream re-encoded by
+  ``HybridT5Encoder`` (routed spans -> ext ids via the Qwen tokenizer; the
+  rest runs through the ordinary T5 tokenizer). Which characters route is
+  the pack's own ``route`` rule: the CJK ranges, plus — in packs built after
+  2026-09-03 — the symbol tail T5 spiece cannot spell (``^^^`` ``:<`` ``~``
+  ``·`` ``×`` ``☆``, emoji), which the stock path folds into one ``<unk>``.
+  Prompts with no routed character return the inner tokenizer's stream
+  untouched — English-only prompts are bit-identical with or without the
+  pack. A pack without ``route`` routes CJK only, exactly as before.
 - **MODEL side**: ComfyUI core hardcodes the 32128-row
   ``llm_adapter.embed`` table, and an id ``>= 32128`` would hard-crash the
   embedding lookup. A ``forward_pre_hook`` on ``llm_adapter`` clamps ext
@@ -152,9 +156,19 @@ class VocabPackTokenizer:
 
     def tokenize_with_weights(self, text: str, return_word_ids=False, **kwargs):
         out = self._vp_inner.tokenize_with_weights(text, return_word_ids, **kwargs)
-        if any(_ev.is_cjk_char(c) for c in text):
+        if self._vp_routes(text):
             out["t5xxl"] = self._vp_t5_stream(text, return_word_ids)
         return out
+
+    def _vp_routes(self, text: str) -> bool:
+        # The routing rule lives in the pack json (``route``: CJK ranges plus
+        # the symbol tail T5 cannot spell — ^ < ~ · × ☆, emoji). An ext_vocab
+        # older than that field has no ``routes``; fall back to the legacy
+        # CJK-only predicate so an old vendor tree keeps working unchanged.
+        enc = self._vp_encoder
+        if hasattr(enc, "routes"):
+            return enc.routes(text)
+        return any(_ev.is_cjk_char(c) for c in text)
 
     def _vp_t5_stream(self, text: str, return_word_ids: bool):
         from comfy.sd1_clip import escape_important, token_weights, unescape_important
@@ -164,7 +178,9 @@ class VocabPackTokenizer:
         word_idx = 0
         for segment, weight in token_weights(escape_important(text), 1.0):
             segment = unescape_important(segment)
-            for kind, span in _ev.segment_runs(segment):
+            for kind, span in _ev.segment_runs(
+                segment, getattr(enc, "route", None)
+            ):
                 if kind == "cjk":
                     ids, _offs = enc._encode_cjk_words(span)
                 else:
