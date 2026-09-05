@@ -29,6 +29,16 @@ surfaces, both reverted by ComfyUI's normal unpatch machinery:
 
 The sidecar JSON must sit next to the safetensors with the same stem
 (``foo.safetensors`` + ``foo.json``) — both files ship together.
+
+Quote partition (3.10.0): a pack may carry an **isotropic block** —
+content-free rows regenerated from ``mapping["iso"]`` (seed, dim, norm) —
+that mirrors the trained rows at an offset. Text inside ``「…」`` / ``『…』`` /
+``"…"`` routes to the mirror, bare CJK to the trained rows (the rule is the
+pack's ``route.quotes``). A pack shipped seed-only (no iso rows in the
+safetensors) is regenerated here at load. The pack's digest
+(``ext_vocab.pack_digest``) is compared with the ``ss_ext_pack_sha`` a LoRA
+trained through a pack stamps — either node order — and a mismatch logs a
+warning (the LoRA still applies).
 """
 
 import importlib
@@ -79,10 +89,25 @@ T5_UNK_ID = _ev.T5_UNK_ID
 
 # Cache: path -> (ext table fp32 cpu, mapping dict).
 _pack_cache: Dict[str, Tuple[torch.Tensor, dict]] = {}
+# Cache: path -> pack digest (``ext_vocab.pack_digest``), "" when the vendored
+# runtime predates it.
+_digest_cache: Dict[str, str] = {}
+
+# ``model_options`` keys the two loaders use to find each other, whichever
+# runs first (ModelPatcher.clone() carries model_options forward).
+PACK_SHA_KEY = "anima_vocab_pack_sha"
+PACK_NAME_KEY = "anima_vocab_pack"
+ADAPTER_SHA_KEY = "anima_adapter_ext_pack_sha"
+ADAPTER_NAME_KEY = "anima_adapter_ext_pack"
 
 
 def load_vocab_pack(path: str) -> Tuple[torch.Tensor, dict]:
-    """Load ``ext_embed`` + the same-stem JSON sidecar, with caching."""
+    """Load ``ext_embed`` + the same-stem JSON sidecar, with caching.
+
+    A pack shipped seed-only (``iso`` record, rows absent) has its
+    isotropic block regenerated here — the table handed on is always the
+    full one the json describes.
+    """
     if path in _pack_cache:
         return _pack_cache[path]
     from safetensors.torch import load_file
@@ -102,13 +127,59 @@ def load_vocab_pack(path: str) -> Tuple[torch.Tensor, dict]:
             ".safetensors + .json pair with the same stem; copy both files."
         )
     mapping = json.loads(sidecar.read_text(encoding="utf-8"))
+    if hasattr(_ev, "materialize_iso"):
+        n_before = table.shape[0]
+        table = _ev.materialize_iso(table, mapping)
+        if table.shape[0] != n_before:
+            logger.info(
+                "vocab pack: regenerated %d isotropic rows from seed %s",
+                table.shape[0] - n_before,
+                (mapping.get("iso") or {}).get("seed"),
+            )
+    elif mapping.get("iso"):
+        raise ValueError(
+            f"{os.path.basename(path)} carries an isotropic block (quote "
+            "partition) but this node's ext_vocab runtime predates it — update "
+            "the Anima Adapter Loader node (>= 3.10.0)."
+        )
     if int(mapping.get("rows", table.shape[0])) != table.shape[0]:
         raise ValueError(
             f"vocab pack mismatch: sidecar says {mapping['rows']} rows, "
             f"tensor has {table.shape[0]} — the .json is from a different pack."
         )
     _pack_cache[path] = (table, mapping)
+    _digest_cache[path] = (
+        _ev.pack_digest(table, mapping) if hasattr(_ev, "pack_digest") else ""
+    )
     return table, mapping
+
+
+def vocab_pack_digest(path: str) -> str:
+    """``ext_vocab.pack_digest`` of a loaded pack ("" if unavailable)."""
+    load_vocab_pack(path)
+    return _digest_cache.get(path, "")
+
+
+def check_pack_vs_adapter(
+    pack_name: str, pack_sha: str, adapter_name: str, adapter_sha: str
+) -> bool:
+    """Warn (once per pairing) when a LoRA's stamped pack digest differs from
+    the loaded pack's. Returns True when they match or nothing to compare."""
+    if not pack_sha or not adapter_sha:
+        return True
+    if pack_sha == adapter_sha:
+        return True
+    logger.warning(
+        "vocab pack mismatch: adapter was trained through pack %s (sha %s…) "
+        "but the loaded vocab pack is %s (sha %s…). CJK / quoted prompt spans "
+        "will hit rows the LoRA never saw; use the pack the LoRA was trained "
+        "with (English prompts are unaffected).",
+        adapter_name,
+        adapter_sha[:12],
+        pack_name,
+        pack_sha[:12],
+    )
+    return False
 
 
 def build_encoder(clip, mapping: dict):
@@ -176,15 +247,26 @@ class VocabPackTokenizer:
         enc = self._vp_encoder
         pairs = []
         word_idx = 0
+        # Quote partition (packs with ``iso`` + ``route.quotes``): the quote
+        # intervals are found once per weighted segment, and routed runs are
+        # cut at them inside ``encode_cjk_run`` (quoted content → isotropic
+        # mirror). An ext_vocab older than that has neither attribute and the
+        # legacy per-run path is used.
+        cut_runs = getattr(enc, "encode_cjk_run", None)
         for segment, weight in token_weights(escape_important(text), 1.0):
             segment = unescape_important(segment)
+            quotes = enc.quote_spans(segment) if cut_runs is not None else []
+            start = 0
             for kind, span in _ev.segment_runs(
                 segment, getattr(enc, "route", None)
             ):
-                if kind == "cjk":
+                if kind == "cjk" and cut_runs is not None:
+                    ids, _offs = cut_runs(span, start, quotes)
+                elif kind == "cjk":
                     ids, _offs = enc._encode_cjk_words(span)
                 else:
                     ids = enc.t5_tok(span, add_special_tokens=False)["input_ids"]
+                start += len(span)
                 for i in ids:
                     i = int(i)
                     pairs.append(
@@ -200,13 +282,24 @@ class VocabPackTokenizer:
         return getattr(self._vp_inner, name)
 
 
-def apply_vocab_pack(model, table: torch.Tensor) -> None:
+def apply_vocab_pack(
+    model, table: torch.Tensor, *, digest: str = "", name: str = ""
+) -> None:
     """Install the ext-row hooks on an already-cloned ModelPatcher.
 
     The table stays on CPU in fp32; only the rows a prompt actually uses are
     gathered and moved to the embed output's device/dtype (a handful of KB
-    per encode — no resident VRAM cost).
+    per encode — no resident VRAM cost). ``digest``/``name`` are recorded
+    in ``model_options`` so an adapter loaded later (or earlier) can be
+    checked against the pack.
     """
+    opts = getattr(model, "model_options", None)
+    if isinstance(opts, dict):
+        opts[PACK_SHA_KEY] = digest
+        opts[PACK_NAME_KEY] = name
+        check_pack_vs_adapter(
+            name, digest, opts.get(ADAPTER_NAME_KEY, "?"), opts.get(ADAPTER_SHA_KEY, "")
+        )
     diffusion_model = model.get_model_object("diffusion_model")
     if not hasattr(diffusion_model, "llm_adapter"):
         raise RuntimeError(

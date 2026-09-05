@@ -38,6 +38,7 @@ from .vocab_pack import (
     apply_vocab_pack,
     build_encoder,
     load_vocab_pack,
+    vocab_pack_digest,
 )
 
 # Vocab packs are not LoRAs — give them their own models/ folder so they
@@ -390,7 +391,12 @@ class AnimaVocabPackLoader:
         table, mapping = load_vocab_pack(file_path)
         encoder = build_encoder(clip, mapping)
         new_model = model.clone()
-        apply_vocab_pack(new_model, table)
+        apply_vocab_pack(
+            new_model,
+            table,
+            digest=vocab_pack_digest(file_path),
+            name=os.path.basename(file_path),
+        )
         new_clip = clip.clone()
         new_clip.tokenizer = VocabPackTokenizer(new_clip.tokenizer, encoder)
         return (new_model, new_clip)

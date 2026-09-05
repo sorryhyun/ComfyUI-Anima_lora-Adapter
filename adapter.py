@@ -14,6 +14,7 @@ instead of being averaged out by a uniform bake.
 import importlib
 import json
 import logging
+import os
 import re
 import sys
 from collections import OrderedDict
@@ -458,6 +459,10 @@ def load_adapter(file_path: str) -> dict:
         "hydra": hydra,
         "chimera_dual_a": chimera_dual,
         "reft": _parse_reft(weights_sd),
+        # ss_ext_pack_sha: the LoRA was trained through a CJK vocab pack and
+        # is coupled to its rows + routing (vocab_pack.check_pack_vs_adapter).
+        "ext_pack": str(file_metadata.get("ss_ext_pack", "") or ""),
+        "ext_pack_sha": str(file_metadata.get("ss_ext_pack_sha", "") or ""),
     }
     _adapter_cache[file_path] = bundle
 
@@ -1095,6 +1100,35 @@ def _apply_reft_to_model(model, reft_blocks: Dict[int, dict], strength: float) -
     return patched
 
 
+def _record_ext_pack_stamp(model, bundle: dict) -> None:
+    """Stash the LoRA's ``ss_ext_pack_sha`` on ``model_options`` and compare
+    it with a vocab pack already applied upstream (either node order)."""
+    sha = bundle.get("ext_pack_sha") or ""
+    if not sha:
+        return
+    opts = getattr(model, "model_options", None)
+    if not isinstance(opts, dict):
+        return
+    from . import vocab_pack as _vp
+
+    name = bundle.get("ext_pack") or os.path.basename(bundle["path"])
+    opts[_vp.ADAPTER_SHA_KEY] = sha
+    opts[_vp.ADAPTER_NAME_KEY] = name
+    pack_sha = opts.get(_vp.PACK_SHA_KEY, "")
+    if pack_sha:
+        _vp.check_pack_vs_adapter(opts.get(_vp.PACK_NAME_KEY, "?"), pack_sha, name, sha)
+    else:
+        logger.warning(
+            "%s was trained through vocab pack %s (sha %s…) but no "
+            "AnimaVocabPackLoader precedes it in this chain — CJK / quoted "
+            "prompt spans will not reach the rows it was trained on. Add the "
+            "vocab pack node (before or after this one) with that pack.",
+            os.path.basename(bundle["path"]),
+            name,
+            sha[:12],
+        )
+
+
 def apply_adapter(
     model, file_path: str, strength_lora: float, strength_reft: float
 ) -> bool:
@@ -1104,6 +1138,7 @@ def apply_adapter(
     """
     bundle = load_adapter(file_path)
     applied_any = False
+    _record_ext_pack_stamp(model, bundle)
 
     if bundle["hydra"] is not None:
         n = _apply_hydra_live_to_model(model, bundle["hydra"], strength_lora)
