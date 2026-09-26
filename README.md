@@ -87,6 +87,18 @@ The pure-compute router math (FEI 2-band / FEI n-band high-to-low, σ sinusoidal
 
 ## Changelog
 
+### 3.11.0 — 2026-09-26 — vocab pack: line block
+
+A pack may now carry a **line block** (`line` in the `.json`: one vector
+plus the source rows). The block (every trained row + the vector) is
+regenerated at load and appended after the other blocks. The CLIP side
+moves each CJK token that has another pack token right beside it (a
+spelled word, a line of pieces) to its mirror there, while a lone glyph
+keeps its row. The MODEL side is unchanged, still a row lookup. Packs
+without `line` behave exactly as before. A pack with it needs this node
+(>= 3.11.0), and an older node refuses it with that message. Vendored
+`ext_vocab.py` re-synced.
+
 ### 3.10.0 — 2026-09-05 — vocab pack: quote partition + LoRA↔pack digest check
 
 A pack may now carry an **isotropic block** — content-free rows regenerated from a seed (`iso` in the `.json`: seed, dim, norm) that mirror the trained rows at an offset. Text inside `「…」` / `『…』` / `"…"` routes to the mirror; bare CJK tags keep the trained rows; the delimiters stay where they were. The rule is the pack's own `route.quotes`, so packs without it (every pack published before this) behave exactly as before, and a pack shipped seed-only (no iso rows in the safetensors) is regenerated at load. A LoRA trained through a pack carries `ss_ext_pack_sha`; the Adapter Loader and the Vocab Pack Loader compare it with the loaded pack's digest in either node order and log a warning on mismatch (or when the LoRA is stamped and no pack node is in the chain). Vendored `ext_vocab.py` re-synced.

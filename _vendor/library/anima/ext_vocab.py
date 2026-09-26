@@ -1,7 +1,6 @@
 """CJK vocab extension for the LLM Adapter's T5-side query stream.
 
-Promoted from ``bench/cjk_adapter/ext_vocab.py`` (which now re-exports from
-here) — the runtime surface (``segment_runs`` / ``HybridT5Encoder`` /
+The runtime surface (``segment_runs`` / ``HybridT5Encoder`` /
 ``load_ext_assets``) is what the vocab-pack loaders (in-repo shim, ComfyUI
 node vendor tree) consume; the ``build_*`` / ``fit_anchor_map`` helpers are
 build-time only (``bench/cjk_adapter/build_ext.py``).
@@ -18,21 +17,20 @@ Byte-fragment fallback: Qwen is byte-BPE, so some chars tokenize as UTF-8
 fragments. Those get per-character supplementary rows, initialised from the
 mapped mean of their fragment embeddings. Plain mean is order-invariant, so
 two chars whose UTF-8 bytes are permutations of each other would collide
-bit-identically (527 such pairs, e.g. 鯰/鰯 — the Phase 0.2 separability
-finding); exactly those colliding rows use a position-weighted mean instead,
+bit-identically (527 such pairs, e.g. 鯰/鰯); exactly those colliding rows use a position-weighted mean instead,
 which breaks the tie while leaving every non-colliding row at the plain mean.
 
-Symbol routing (2026-09-03): the stock spiece also has no row for a long
+Symbol routing: the stock spiece also has no row for a long
 tail of non-CJK symbols (``^`` ``<`` ``~`` ``·`` ``×`` ``☆``, emoji …) that
 danbooru tags and zh names use — T5 folds ``^^^`` into a single ``<unk>``, so
 ``^^^`` / ``☆`` / ``\\`` were the same token. Those chars are routed to the
 Qwen side exactly like CJK, with their rows appended *after* the CJK blocks
 (``mapping["sym"]`` / ``mapping["sym_char"]``) so every pre-existing row id,
 distill cache and trained pack stays valid. The routing rule ships **inside
-the pack json** (``mapping["route"]``); a pack without it routes the legacy
-CJK ranges only, bit-identical to before.
+the pack json** (``mapping["route"]``); a pack without it routes the CJK
+ranges only.
 
-Quote partition (2026-09-05, DiT line D1): a pack may carry a second,
+Quote partition: a pack may carry a second,
 **content-free isotropic block** (``mapping["iso"]``: i.i.d. Gaussian rows
 regenerated from ``(seed, n_rows, dim, norm)`` — :func:`iso_block`) that
 mirrors the trained blocks row-for-row at an offset. Routed spans *inside a
@@ -41,6 +39,16 @@ isotropic block; bare CJK keeps the trained rows; the delimiters themselves
 stay on their usual path (``「」`` → trained row, ``"`` → spiece). A pack
 without ``iso`` encodes bit-identically to before. :func:`pack_digest` is
 the hash a LoRA trained through the pack stamps (``ss_ext_pack_sha``).
+
+Line block: a pack may carry a **line mode** (``mapping["line"]``: a vector
+``vec`` and the source rows ``[0, src_end)``). The block ``table[:src_end] +
+vec`` is regenerated at load and appended after every other block; the
+encoder moves each ext id that has an ext neighbour in the T5 id stream (a
+spelled word, a line of pieces — a lone glyph or piece has none) to its
+mirror there (:func:`line_gate`). It is the vocab-pack form of the
+cjk_anima_scale line's gated ``v_line`` (``project/cjk_anima_scale/
+proposal.md`` § 1): the model side stays a plain row lookup. A pack without
+``line`` encodes bit-identically to before.
 
 Pure-CPU module — no model load; consumers pass embedding tensors in.
 """
@@ -157,7 +165,7 @@ class Route:
         return spans
 
 
-# The quote pairs the D1 span rule recognises (principle 8 of the DiT plan):
+# The quote pairs the span rule recognises:
 # CJK corner brackets (both weights) and the ASCII double quote new caption
 # builders emit. Script-neutral by design.
 DEFAULT_QUOTES: tuple[tuple[str, str], ...] = (("「", "」"), ("『", "』"), ('"', '"'))
@@ -263,10 +271,107 @@ def materialize_iso(table: torch.Tensor, mapping: dict) -> torch.Tensor:
     return torch.cat([table, spec.build().to(table.dtype)])
 
 
+# ---------------------------------------------------------------------------
+# Line block — the source rows plus one mode vector, regenerated at load
+# ---------------------------------------------------------------------------
+
+LINE_RECIPE = "row_plus_vec_v1"
+
+
+@dataclass(frozen=True)
+class LineSpec:
+    """The ``mapping["line"]`` record: the block ``table[:src_end] + vec`` at
+    rows ``[start, start + src_end)`` (after the trained blocks and ``iso``)."""
+
+    src_end: int
+    start: int
+    vec: tuple[float, ...]
+    recipe: str = LINE_RECIPE
+
+    @property
+    def end(self) -> int:
+        return self.start + self.src_end
+
+    @classmethod
+    def from_mapping(cls, mapping: dict | None) -> "LineSpec | None":
+        spec = (mapping or {}).get("line")
+        if not spec:
+            return None
+        start, end = spec["rows"]
+        src0, src_end = spec["src"]
+        if int(src0) != 0 or int(end) - int(start) != int(src_end):
+            raise ValueError(f"bad line record: src {spec['src']} rows {spec['rows']}")
+        return cls(
+            src_end=int(src_end),
+            start=int(start),
+            vec=tuple(float(x) for x in spec["vec"]),
+            recipe=str(spec.get("recipe", LINE_RECIPE)),
+        )
+
+    def to_json(self, **extra) -> dict:
+        return {
+            "recipe": self.recipe,
+            "src": [0, self.src_end],
+            "rows": [self.start, self.end],
+            "gate": "ext_neighbour",
+            "vec": list(self.vec),
+            **extra,
+        }
+
+    def build(self, table: torch.Tensor) -> torch.Tensor:
+        if self.recipe != LINE_RECIPE:
+            raise ValueError(f"unknown line recipe {self.recipe!r} (have {LINE_RECIPE})")
+        v = torch.tensor(self.vec, dtype=torch.float32)
+        return (table[: self.src_end].float() + v).to(table.dtype)
+
+
+def materialize_line(table: torch.Tensor, mapping: dict) -> torch.Tensor:
+    """Append the line block (after :func:`materialize_iso`) when the pack
+    shipped without its rows. Raises when the table is neither
+    ``[0, start)`` nor ``[0, end)`` rows."""
+    spec = LineSpec.from_mapping(mapping)
+    if spec is None:
+        return table
+    if table.shape[0] == spec.end:
+        return table
+    if table.shape[0] != spec.start:
+        raise ValueError(
+            f"vocab pack mismatch: line block starts at row {spec.start} but the "
+            f"table has {table.shape[0]} rows"
+        )
+    return torch.cat([table, spec.build(table)])
+
+
+def materialize(table: torch.Tensor, mapping: dict) -> torch.Tensor:
+    """Every regenerated block, in table order (``iso``, then ``line``)."""
+    return materialize_line(materialize_iso(table, mapping), mapping)
+
+
+def line_gate(ids: list[int]) -> list[bool]:
+    """The line mode's gate on a T5 id stream: an ext id (``>= T5_TABLE_SIZE``)
+    with an ext id directly left or right of it."""
+    ext = [int(i) >= T5_TABLE_SIZE for i in ids]
+    n = len(ext)
+    return [
+        ext[k] and ((k > 0 and ext[k - 1]) or (k + 1 < n and ext[k + 1]))
+        for k in range(n)
+    ]
+
+
 # Mapping keys that describe the *rows and routing* — what a LoRA trained
 # through the pack is coupled to. Provenance (``training`` / ``stats``) is
 # excluded so a re-annotated json keeps its digest.
-_DIGEST_KEYS = ("qwen", "char", "sym", "sym_char", "word", "word_sub", "route", "iso")
+_DIGEST_KEYS = (
+    "qwen",
+    "char",
+    "sym",
+    "sym_char",
+    "word",
+    "word_sub",
+    "route",
+    "iso",
+    "line",
+)
 
 
 def pack_digest(table: torch.Tensor, mapping: dict) -> str:
@@ -276,7 +381,7 @@ def pack_digest(table: torch.Tensor, mapping: dict) -> str:
     ComfyUI node compute it the same way so a LoRA meeting a different pack
     (rows, ids or quote rule) is detectable, never silent.
     """
-    table = materialize_iso(table, mapping)
+    table = materialize(table, mapping)
     h = hashlib.sha256()
     h.update(table.detach().to("cpu", torch.float32).contiguous().numpy().tobytes())
     sub = {k: mapping[k] for k in _DIGEST_KEYS if mapping.get(k)}
@@ -433,7 +538,7 @@ def fit_anchor_map(
     ``method="ridge"`` — plain ridge least squares (the v1 asset). Ridge
     shrinks toward the directions the anchors share, so the mapped ext keys
     collapse onto a thin subspace (PR 236 of 1024, 16 % of random row pairs
-    above cos 0.5; ``probes/map_probe.py``, 2026-09-02).
+    above cos 0.5; ``project/finished/cjk_aware_anima/probes/map_probe.py``).
 
     ``method="procrustes-mix"`` — ridge plus ``mix`` × the scaled orthogonal
     Procrustes rotation fitted on the same anchors (centered fit, applied as
@@ -613,6 +718,10 @@ class HybridT5Encoder:
     # With ``route.quotes`` set, routed spans inside a quote pair land on
     # ``T5_TABLE_SIZE + iso_offset + row`` instead of the trained row.
     iso_offset: int | None = None
+    # The line block (``mapping["line"]``): ext ids below ``line_src_end``
+    # with an ext neighbour move to ``T5_TABLE_SIZE + line_start + row``.
+    line_start: int | None = None
+    line_src_end: int | None = None
 
     @classmethod
     def from_mapping(cls, t5_tok, qwen_tok, mapping: dict) -> "HybridT5Encoder":
@@ -640,7 +749,20 @@ class HybridT5Encoder:
             word_sub=mapping.get("word_sub") or None,
             route=Route.from_mapping(mapping),
             iso_offset=(iso.start if (iso := IsoSpec.from_mapping(mapping)) else None),
+            line_start=(ln.start if (ln := LineSpec.from_mapping(mapping)) else None),
+            line_src_end=ln.src_end if ln else None,
         )
+
+    def apply_line(self, ids: list[int]) -> list[int]:
+        """Move every gated ext id (:func:`line_gate`) with a source row to
+        its line-block mirror; unchanged when the pack has no line block."""
+        if self.line_start is None:
+            return ids
+        lo, hi = T5_TABLE_SIZE, T5_TABLE_SIZE + int(self.line_src_end)
+        return [
+            i + self.line_start if g and lo <= i < hi else i
+            for i, g in zip(ids, line_gate(ids))
+        ]
 
     @property
     def quote_routing(self) -> bool:
@@ -708,13 +830,12 @@ class HybridT5Encoder:
         base vocab would spell out char-by-char; everything between matches
         goes through the ordinary Qwen path unchanged.
 
-        Eojeol boundary guard (plan_ko3 risk 1): a hangul surface may only
+        Eojeol boundary guard: a hangul surface may only
         match where an eojeol starts — BOS, or after a non-hangul char
         (space/punct/other script). Particles attach at the *end* of an
         eojeol, so a boundary-anchored prefix match still fires on 레이무가;
         what the guard kills is a surface waking up mid-word (…아레이무…).
-        JA has no spaces — minting JA words is deferred until it gets its own
-        boundary design (plan_ko3 M3).
+        The guard is hangul-only (JA has no spaces to anchor on).
         """
         surfaces: set[str] = set(self.word_map or ()) | set(self.word_sub or ())
         if not surfaces:
@@ -788,6 +909,7 @@ class HybridT5Encoder:
             ids.extend(s_ids)
             offs.extend((base + a, base + b) for a, b in s_offs)
             base += len(span)
+        ids = self.apply_line(ids)
 
         keep = max_length - 1
         ids, offs = ids[:keep], offs[:keep]
@@ -858,13 +980,13 @@ class HybridT5Encoder:
 def load_ext_assets(prefix: Path) -> tuple[torch.Tensor, dict]:
     """Load (table, mapping) written by build_ext.py from a path prefix.
 
-    A pack that ships its ``iso`` record without the rows gets the block
-    regenerated here (:func:`materialize_iso`), so every consumer sees the
-    full table.
+    A pack that ships its ``iso`` / ``line`` record without the rows gets
+    the block regenerated here (:func:`materialize`), so every consumer sees
+    the full table.
     """
     from safetensors.torch import load_file
 
     prefix = Path(prefix)
     table = load_file(str(prefix.with_suffix(".safetensors")))["ext_embed"]
     mapping = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
-    return materialize_iso(table, mapping), mapping
+    return materialize(table, mapping), mapping
