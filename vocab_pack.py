@@ -40,7 +40,7 @@ safetensors) is regenerated here at load. The pack's digest
 trained through a pack stamps — either node order — and a mismatch logs a
 warning (the LoRA still applies).
 
-Per-glyph routing and the encode fold (3.12.0): a pack with
+Per-glyph routing (3.12.0) and the encode fold (3.13.0): a pack with
 ``mapping["glyph_route"]`` encodes every JA Qwen token as its glyphs' single
 rows (``こんにちは`` → five ids); a pack with ``mapping["fold"]`` rewrites
 characters one-for-one on the t5 side before routing (``！`` → ``!``, ``~`` →

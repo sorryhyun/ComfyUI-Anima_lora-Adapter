@@ -45,7 +45,7 @@ SoftREPA-parameterization soft tokens (Lee et al., arXiv:2503.08250): a bank of 
 | `model` + `clip` | both are patched — wire **both** outputs onward |
 | `vocab_pack` | pack from `models/vocab_packs/` — a `.safetensors` + `.json` pair with the same stem (copy **both** files) |
 
-Lets you type Japanese directly in the prompt (danbooru tags like `猫耳, 銀髪`, quoted phrases, mixed prompts) instead of translating to English first. A vocab pack is **not a LoRA**: it is a table of trained extra text-embedding rows (ids ≥ 32128) plus a JSON sidecar with the segmentation/row maps. The returned CLIP re-tokenizes CJK spans onto those rows via the pack's hybrid encoder (Qwen-tokenized CJK, ordinary T5 for everything else — prompt weighting `(タグ:1.2)` works); the returned MODEL serves the rows through a hook on `llm_adapter.embed`. **English-only prompts are bit-identical with or without this node.** Composes with any Anima checkpoint / LoRA / the other loaders (disjoint parameters). Packs with a quote partition (3.10.0+) route quoted lines — `「…」`, `『…』`, `"…"` — to a content-free isotropic block and bare tags to the trained rows; a LoRA trained through a pack (`ss_ext_pack_sha` in its metadata) is checked against the loaded pack and a mismatch is logged. Packs: [anima-vocab-pack-cjk](https://huggingface.co/sorryhyun/anima-vocab-pack-cjk) (Japanese rendering trained; `preview3` / `preview4` need this node ≥ 3.12.0; ko/zh not trained yet).
+Lets you type Japanese directly in the prompt (danbooru tags like `猫耳, 銀髪`, quoted phrases, mixed prompts) instead of translating to English first. A vocab pack is **not a LoRA**: it is a table of trained extra text-embedding rows (ids ≥ 32128) plus a JSON sidecar with the segmentation/row maps. The returned CLIP re-tokenizes CJK spans onto those rows via the pack's hybrid encoder (Qwen-tokenized CJK, ordinary T5 for everything else — prompt weighting `(タグ:1.2)` works); the returned MODEL serves the rows through a hook on `llm_adapter.embed`. **English-only prompts are bit-identical with or without this node.** Composes with any Anima checkpoint / LoRA / the other loaders (disjoint parameters). Packs with a quote partition (3.10.0+) route quoted lines — `「…」`, `『…』`, `"…"` — to a content-free isotropic block and bare tags to the trained rows; a LoRA trained through a pack (`ss_ext_pack_sha` in its metadata) is checked against the loaded pack and a mismatch is logged. Packs: [anima-vocab-pack-cjk](https://huggingface.co/sorryhyun/anima-vocab-pack-cjk) (Japanese rendering trained; `preview3` needs this node ≥ 3.12.0, `preview4` ≥ 3.13.0; ko/zh not trained yet).
 
 ## How each component applies
 
@@ -87,18 +87,22 @@ The pure-compute router math (FEI 2-band / FEI n-band high-to-low, σ sinusoidal
 
 ## Changelog
 
-### 3.12.0 — 2026-09-30 — vocab pack: per-glyph routing + encode fold; line block removed
+### 3.13.0 — 2026-09-30 — vocab pack: encode fold
+
+A pack with a `fold` map in its `.json` rewrites characters one-for-one on
+the T5 side before routing (`！ ？` → `! ?`, `~` → `～`, `『 【` / `』 】` →
+`「` / `」`); the Qwen3 stream stays the text as typed. `preview4` is trained
+under it. An older node ignores the key and encodes those characters
+unfolded. Vendored `ext_vocab.py` re-synced.
+
+### 3.12.0 — 2026-09-28 — vocab pack: per-glyph routing; line block removed
 
 A pack with `"glyph_route": true` in its `.json` encodes every Japanese
 Qwen token on the T5 side as its glyphs' single rows (`こんにちは` → five
-rows), which is how the retrained packs (`preview3`, `preview4`) were
-trained. A pack with a `fold` map rewrites characters one-for-one on the
-T5 side before routing (`！ ？` → `! ?`, `~` → `～`, `『 【` / `』 】` →
-`「` / `」`); the Qwen3 stream stays the text as typed. An older node
-ignores both keys and encodes those packs the old way, so use this node
-with them. The 3.11.0 line block is removed (the training line dropped it
-before any pack shipped with one); a pack carrying `line` is refused.
-Vendored `ext_vocab.py` re-synced.
+rows), which is how the retrained packs (`preview3` on) were trained. An
+older node ignores the key. The 3.11.0 line block is removed (the training
+line dropped it before any pack shipped with one); a pack carrying `line`
+is refused.
 
 ### 3.11.0 — 2026-09-26 — vocab pack: line block
 
