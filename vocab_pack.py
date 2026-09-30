@@ -40,12 +40,13 @@ safetensors) is regenerated here at load. The pack's digest
 trained through a pack stamps — either node order — and a mismatch logs a
 warning (the LoRA still applies).
 
-Line block (3.11.0): a pack may carry a **line mode** (``mapping["line"]``:
-one vector + the source rows). The block ``rows + vec`` is regenerated at
-load after every other block, and the t5 stream moves each ext id that has
-an ext neighbour (a spelled word / a line of pieces; a lone glyph has none)
-to its mirror there (``ext_vocab.line_gate``). The MODEL side is unchanged —
-still a row lookup.
+Per-glyph routing and the encode fold (3.12.0): a pack with
+``mapping["glyph_route"]`` encodes every JA Qwen token as its glyphs' single
+rows (``こんにちは`` → five ids); a pack with ``mapping["fold"]`` rewrites
+characters one-for-one on the t5 side before routing (``！`` → ``!``, ``~`` →
+``～``, ``『【`` → ``「``). Both live in the vendored ``HybridT5Encoder``; the
+qwen3 stream is the text as typed. The 3.11.0 line block was removed
+upstream — a pack carrying ``line`` is refused by ``ext_vocab``.
 """
 
 import importlib
@@ -148,21 +149,6 @@ def load_vocab_pack(path: str) -> Tuple[torch.Tensor, dict]:
             f"{os.path.basename(path)} carries an isotropic block (quote "
             "partition) but this node's ext_vocab runtime predates it — update "
             "the Anima Adapter Loader node (>= 3.10.0)."
-        )
-    if hasattr(_ev, "materialize_line"):
-        n_before = table.shape[0]
-        table = _ev.materialize_line(table, mapping)
-        if table.shape[0] != n_before:
-            logger.info(
-                "vocab pack: regenerated %d line-block rows (dose %s)",
-                table.shape[0] - n_before,
-                (mapping.get("line") or {}).get("dose"),
-            )
-    elif mapping.get("line"):
-        raise ValueError(
-            f"{os.path.basename(path)} carries a line block but this node's "
-            "ext_vocab runtime predates it — update the Anima Adapter Loader "
-            "node (>= 3.11.0)."
         )
     if int(mapping.get("rows", table.shape[0])) != table.shape[0]:
         raise ValueError(
@@ -277,6 +263,10 @@ class VocabPackTokenizer:
         cut_runs = getattr(enc, "encode_cjk_run", None)
         for segment, weight in token_weights(escape_important(text), 1.0):
             segment = unescape_important(segment)
+            # The pack's encode fold (one char → one char), before routing, as
+            # HybridT5Encoder.encode_aligned does; an older ext_vocab has none.
+            if hasattr(enc, "folded"):
+                segment = enc.folded(segment)
             quotes = enc.quote_spans(segment) if cut_runs is not None else []
             start = 0
             for kind, span in _ev.segment_runs(
@@ -295,11 +285,6 @@ class VocabPackTokenizer:
                         (i, weight, word_idx) if return_word_ids else (i, weight)
                     )
                 word_idx += 1
-        # Line block: gate on the whole stream (neighbours across weighted
-        # segments count, as in HybridT5Encoder.encode_aligned).
-        if getattr(enc, "line_start", None) is not None:
-            moved = enc.apply_line([p[0] for p in pairs])
-            pairs = [(i, *p[1:]) for i, p in zip(moved, pairs)]
         pairs.append(
             (T5_EOS_ID, 1.0, word_idx) if return_word_ids else (T5_EOS_ID, 1.0)
         )
